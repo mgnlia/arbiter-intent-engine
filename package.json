@@ -1,0 +1,20 @@
+{
+  "name": "arbiter-intent-engine",
+  "version": "0.1.0",
+  "description": "AI Intent Engine for Solana DeFi — natural language to autonomous execution",
+  "private": true,
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "test": "turbo test"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
