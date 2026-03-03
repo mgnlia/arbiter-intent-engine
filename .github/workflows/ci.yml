@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  lint-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install web deps
+        working-directory: apps/web
+        run: npm install --legacy-peer-deps
+      - name: Build web
+        working-directory: apps/web
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: https://arbiter-agent.up.railway.app
