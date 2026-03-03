@@ -4,20 +4,32 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+
 jobs:
-  lint-build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
+
       - name: Install web deps
         working-directory: apps/web
         run: npm install --legacy-peer-deps
-      - name: Build web
+
+      - name: Build web (static export)
         working-directory: apps/web
         run: npm run build
         env:
-          NEXT_PUBLIC_API_URL: https://arbiter-agent.up.railway.app
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL || 'https://arbiter-agent.up.railway.app' }}
+
+      - name: Deploy to Netlify
+        if: github.ref == 'refs/heads/main'
+        uses: netlify/actions/cli@master
+        with:
+          args: deploy --prod --dir=apps/web/out
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
