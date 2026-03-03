@@ -1,0 +1,13 @@
+[build]
+  base    = "apps/web"
+  command = "npm install --legacy-peer-deps && npm run build"
+  publish = "out"
+
+[build.environment]
+  NODE_VERSION = "20"
+  NEXT_PUBLIC_API_URL = "https://arbiter-agent.up.railway.app"
+
+[[redirects]]
+  from   = "/*"
+  to     = "/index.html"
+  status = 200
