@@ -1,5 +1,6 @@
 /**
  * Fastify HTTP server — REST API + SSE for real-time updates.
+ * v0.2.0: added portfolio tracker, risk engine, /api/portfolio, /api/risk/evaluate
  */
 import Fastify from "fastify";
 import cors from "@fastify/cors";
@@ -9,11 +10,15 @@ import { IntentParser } from "./intent/parser.js";
 import { StrategyEngine } from "./intent/strategy-engine.js";
 import { Executor } from "./execution/executor.js";
 import { BirdeyeClient } from "./market/birdeye.js";
+import { PortfolioTracker } from "./portfolio/tracker.js";
+import { RiskEngine } from "./risk/risk-engine.js";
 
 const parser = new IntentParser();
 const strategyEngine = new StrategyEngine();
 const executor = new Executor();
 const birdeye = new BirdeyeClient();
+const portfolio = new PortfolioTracker();
+const riskEngine = new RiskEngine();
 
 // SSE subscribers
 const sseClients = new Set<(data: string) => void>();
@@ -31,13 +36,22 @@ export async function createServer() {
   // ── Health ─────────────────────────────────────────────────────────────────
   app.get("/health", async () => ({
     status: "ok",
-    version: "0.1.0",
+    version: "0.2.0",
     simulation: CONFIG.SIMULATION_MODE,
     timestamp: new Date().toISOString(),
+    capabilities: [
+      "intent-parse",
+      "strategy-engine",
+      "risk-engine",
+      "portfolio-tracker",
+      "sse",
+    ],
   }));
 
   // ── Intent endpoint ────────────────────────────────────────────────────────
-  app.post<{ Body: { intent: string; execute?: boolean } }>("/api/intent", async (req, reply) => {
+  app.post<{
+    Body: { intent: string; execute?: boolean; walletAddress?: string };
+  }>("/api/intent", async (req, reply) => {
     const { intent: userInput, execute = false } = req.body;
     if (!userInput?.trim()) {
       return reply.status(400).send({ error: "intent is required" });
@@ -51,12 +65,35 @@ export async function createServer() {
     broadcast("intent_parsed", { intentId, parsed });
 
     if (parsed.type === "unknown" || parsed.confidence < 0.3) {
-      return { intentId, parsed, plan: null, result: null, message: "Could not parse intent — please rephrase" };
+      return {
+        intentId,
+        parsed,
+        plan: null,
+        risk: null,
+        result: null,
+        message: "Could not parse intent — please rephrase",
+      };
     }
 
     // Build plan
     const plan = strategyEngine.buildPlan(parsed, intentId);
     broadcast("plan_built", { intentId, plan });
+
+    // Risk evaluation
+    const tradeValueUsd = parsed.params.amountUsd || parsed.params.amount || 0;
+    const risk = riskEngine.evaluate(plan, tradeValueUsd);
+    broadcast("risk_evaluated", { intentId, risk });
+
+    if (!risk.approved) {
+      return {
+        intentId,
+        parsed,
+        plan,
+        risk,
+        result: null,
+        message: risk.message,
+      };
+    }
 
     // Execute if requested and not requiring confirmation
     let result = null;
@@ -65,18 +102,45 @@ export async function createServer() {
       broadcast("execution_complete", { intentId, result });
     }
 
-    return { intentId, parsed, plan, result };
+    return { intentId, parsed, plan, risk, result };
   });
 
   // ── Execute a pre-built plan ───────────────────────────────────────────────
-  app.post<{ Body: { intentId: string; plan: any } }>("/api/execute", async (req, reply) => {
-    const { intentId, plan } = req.body;
-    if (!plan) return reply.status(400).send({ error: "plan is required" });
+  app.post<{ Body: { intentId: string; plan: any } }>(
+    "/api/execute",
+    async (req, reply) => {
+      const { intentId, plan } = req.body;
+      if (!plan) return reply.status(400).send({ error: "plan is required" });
 
-    broadcast("execution_started", { intentId });
-    const result = await executor.execute(plan);
-    broadcast("execution_complete", { intentId, result });
-    return result;
+      broadcast("execution_started", { intentId });
+      const result = await executor.execute(plan);
+      broadcast("execution_complete", { intentId, result });
+      return result;
+    }
+  );
+
+  // ── Portfolio ──────────────────────────────────────────────────────────────
+  app.get<{ Querystring: { wallet?: string } }>(
+    "/api/portfolio",
+    async (req) => {
+      const wallet = req.query.wallet || "";
+      return portfolio.getSnapshot(wallet);
+    }
+  );
+
+  app.post<{
+    Body: { wallet: string; targetAllocation: Record<string, number> };
+  }>("/api/portfolio/rebalance-preview", async (req, reply) => {
+    const { wallet, targetAllocation } = req.body;
+    if (!targetAllocation)
+      return reply.status(400).send({ error: "targetAllocation required" });
+    const snapshot = await portfolio.getSnapshot(wallet || "");
+    const trades = portfolio.calculateRebalance(snapshot, targetAllocation);
+    return {
+      snapshot,
+      trades,
+      estimatedGasUsd: trades.length * 0.002,
+    };
   });
 
   // ── Market data ────────────────────────────────────────────────────────────
@@ -85,18 +149,35 @@ export async function createServer() {
     return { prices, timestamp: Date.now() };
   });
 
-  app.get<{ Params: { symbol: string } }>("/api/prices/:symbol", async (req, reply) => {
-    const prices = await birdeye.getAllPrices();
-    const price = prices[req.params.symbol.toUpperCase()];
-    if (!price) return reply.status(404).send({ error: "Symbol not found" });
-    return price;
-  });
+  app.get<{ Params: { symbol: string } }>(
+    "/api/prices/:symbol",
+    async (req, reply) => {
+      const prices = await birdeye.getAllPrices();
+      const price = prices[req.params.symbol.toUpperCase()];
+      if (!price) return reply.status(404).send({ error: "Symbol not found" });
+      return price;
+    }
+  );
 
   app.get("/api/yields", async (req) => {
-    const risk = (req.query as any).risk as "low" | "medium" | "high" | undefined;
+    const risk = (req.query as any).risk as
+      | "low"
+      | "medium"
+      | "high"
+      | undefined;
     const opps = await birdeye.getYieldOpportunities(risk);
     return { opportunities: opps, timestamp: Date.now() };
   });
+
+  // ── Risk check ─────────────────────────────────────────────────────────────
+  app.post<{ Body: { plan: any; tradeValueUsd?: number } }>(
+    "/api/risk/evaluate",
+    async (req, reply) => {
+      const { plan, tradeValueUsd = 0 } = req.body;
+      if (!plan) return reply.status(400).send({ error: "plan is required" });
+      return riskEngine.evaluate(plan, tradeValueUsd);
+    }
+  );
 
   // ── SSE stream ─────────────────────────────────────────────────────────────
   app.get("/api/stream", async (req, reply) => {
@@ -111,9 +192,13 @@ export async function createServer() {
     };
 
     sseClients.add(send);
-    send(`event: connected\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+    send(
+      `event: connected\ndata: ${JSON.stringify({
+        ts: Date.now(),
+        version: "0.2.0",
+      })}\n\n`
+    );
 
-    // Heartbeat
     const hb = setInterval(() => {
       if (!reply.raw.writableEnded) {
         reply.raw.write(`:heartbeat\n\n`);
@@ -127,7 +212,6 @@ export async function createServer() {
       clearInterval(hb);
     });
 
-    // Keep alive
     await new Promise(() => {});
   });
 
